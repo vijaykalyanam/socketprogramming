@@ -1,0 +1,13 @@
+
+socket/connect/bind/read/write ---> all are system calls located in syscall table.
+Every system call is identified as system call Number.
+Link to add new system call:
+https://medium.com/@ssreehari/implementing-a-system-call-in-linux-kernel-4-7-1-6f98250a8c38
+https://tssurya.wordpress.com/2014/08/19/adding-a-hello-world-system-call-to-linux-kernel-3-16-0/
+
+
+OUT-OF-BAND Data: Out of Band data by-pass the regular TCP data and retrieved at the receiving end prior to
+	regular data.
+To send OOB, we need to use "send" syscall.
+In "select", return "exception" upon receiving OOB data.
+
