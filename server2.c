@@ -28,8 +28,8 @@ int main(int argc, char **argp) {
 
 	//BIND address to socket     Assigning address space to server socket
 	server_addr4.sin_family = AF_INET;
-	server_addr4.sin_port   = htons(12345);
-	server_addr4.sin_addr.s_addr   = inet_addr("193.168.1.111");
+	server_addr4.sin_port   = htons(10001);
+	server_addr4.sin_addr.s_addr   = inet_addr("192.168.1.123");
 
 	// assigning name to a socket
 	ret = bind(server, (const struct sockaddr *)&server_addr4, sizeof (server_addr4));
