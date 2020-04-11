@@ -1,0 +1,13 @@
+1. struct sockaddr_ll : Link-Layer socket descriptor
+	Packet sockets are used to receive or send raw packets at the device driver (OSI Layer 2) level.
+	They allow the user to implement protocol modules in user space on top of the physical layer.
+
+	sockaddr_ll has interface index where socket directly binds to interface depends on that.
+	Remember, raw socket program do not bind to something like connection oriented things.
+
+2. Ensure that while using sendto syscall, passing the right arguments.
+sendto(sock, (const void *)req, sizeof(struct arp_packet), 0,
+                                (struct sockaddr *)dev, sizeof(struct sockaddr_ll));
+
+3. During the retrieval/interveince of RX data, it is already in network byte order.
+
