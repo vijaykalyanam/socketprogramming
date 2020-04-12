@@ -128,7 +128,7 @@ struct ethernet_frame {
 	struct ethhdr ethh;
 	struct iphdr iph;
 	struct udphdr udph;
-};
+} __attribute__((packed));
 
 struct udp_packets {
 	unsigned char *buffer;
@@ -140,7 +140,12 @@ struct udp_packets {
 struct udp_packets pkts;
 static void *buffer;
 static unsigned int frame_len = 1024;
+
+pthread_t pt;
 static unsigned long prev_time;
+static unsigned long tx_packets;
+static unsigned long prev_tx_packets;
+static unsigned long total_tx_packets;
 
 static const char *dst_addr = "";
 static const char *if_name = "";
@@ -341,8 +346,10 @@ static void int_exit(int sig)
 {
 	(void)sig;
 
-	printf("Freed Buffer\n");
-	//free(buffer);
+	if (buffer) {
+		munmap(buffer, 1024 * 4096);
+		buffer = NULL;
+	}
 	exit(EXIT_SUCCESS);
 }
 
@@ -359,35 +366,25 @@ static void *poller(void *arg)
 	(void)arg;
 	for (;;) {
 		sleep(1);
+
 		unsigned long now = get_nsecs();
 		long dt = now - prev_time;
 		int i;
 
 		prev_time = now;
 
-#if 0
-		for (i = 0; i < num_socks && xsks[i]; i++) {
-			char *fmt = "%-15s %'-11.0f %'-11lu\n";
-			double rx_pps, tx_pps;
+		char *fmt = "%-15s %'-11.0f %'-11lu\n";
+		double tx_pps;
 
-			rx_pps = (xsks[i]->rx_npkts - xsks[i]->prev_rx_npkts) *
-				1000000000. / dt;
-			tx_pps = (xsks[i]->tx_npkts - xsks[i]->prev_tx_npkts) *
-				1000000000. / dt;
+		tx_pps = (tx_packets - prev_tx_packets) *
+			1000000000. / dt;
 
-			printf("\n sock%d@", i);
-			print_benchmark(false);
-			printf("\n");
+		printf("\n");
+		printf("%-15s %-11s %-11s %-11.2f\n", "", "pps", "pkts",
+				dt / 1000000000.);
+		printf(fmt, "tx", tx_pps, tx_packets);
 
-			printf("%-15s %-11s %-11s %-11.2f\n", "", "pps", "pkts",
-					dt / 1000000000.);
-			printf(fmt, "rx", rx_pps, xsks[i]->rx_npkts);
-			printf(fmt, "tx", tx_pps, xsks[i]->tx_npkts);
-
-			xsks[i]->prev_rx_npkts = xsks[i]->rx_npkts;
-			xsks[i]->prev_tx_npkts = xsks[i]->tx_npkts;
-		}
-#endif
+		prev_tx_packets = tx_packets;
 	}
 	return NULL;
 }
@@ -470,15 +467,17 @@ static int process_udp_transfers(struct udp_packets *pkts, struct sockaddr_ll *s
 		return sock;
 	}
 
-	for (i = 0; i < pkts->total_packets; i++) {
-		rc = sendto(sock, pkts->frames[i], pkts->packet_len, 0,
-				(struct sockaddr *)src_dev, sizeof(struct sockaddr_ll));
-		if (rc <= 0) {
-			printf("RETURN :%d\n", rc);
-			perror ("sendto failed\n");
-			goto failure;
+	while (1) {
+		for (i = 0; i < pkts->total_packets; i++) {
+			rc = sendto(sock, pkts->frames[i], pkts->packet_len, 0,
+					(struct sockaddr *)src_dev, sizeof(struct sockaddr_ll));
+			if (rc <= 0) {
+				printf("RETURN :%d\n", rc);
+				perror ("sendto failed\n");
+				goto failure;
+			}
+			++tx_packets;
 		}
-		break;
 	}
 
 failure:
@@ -492,7 +491,6 @@ static int send_udp_traffic(struct sockaddr_ll *src, struct sockaddr_ll *dst,
 {
 
 	struct rlimit r = {RLIM_INFINITY, RLIM_INFINITY};
-	pthread_t pt;
 	int upd_socket;
 	int ret;
 
@@ -526,15 +524,16 @@ static int send_udp_traffic(struct sockaddr_ll *src, struct sockaddr_ll *dst,
 		printf("Failed to setup UDP Packets\n");
 		return ret;
 	}
+
+	prev_time = get_nsecs();
+	ret = pthread_create(&pt, NULL, poller, NULL);
+	if (ret) {
+		printf("Failed to setup Thread");
+	}
+
 	ret = process_udp_transfers(&pkts, src);
 	if (ret < 0) {
 	}
-#if 0
-	ret = pthread_create(&pt, NULL, poller, NULL);
-	if (ret)
-		
-	prev_time = get_nsecs();
-#endif
 	return 0;
 }
 
@@ -659,8 +658,15 @@ int main(int argc, char **argv)
 	rc = send_udp_traffic(&src_dev, &dst_dev, &src_ip, &dst_ip);
 #endif
 failure:
-	free(req);
-	free(resp);
+	if (req) {
+		free(req);
+		req = NULL;
+	}
+
+	if (resp) {
+		free(resp);
+		resp = NULL;
+	}
 
 	return rc;
 }
