@@ -308,7 +308,7 @@ static int process_arp_request(struct sockaddr_ll *src_dev,
 	arph = &resp->arph;
 	ethh = &resp->ethh;
 
-	while(1) {	
+	while(1) {
 		rc = sendto(sock, (const void *)req, sizeof(struct arp_packet), 0,
 				(struct sockaddr *)src_dev, sizeof(struct sockaddr_ll));
 		if (rc < 0) {
@@ -392,18 +392,6 @@ static void cleanup_threads()
 	exit(0);
 }
 
-static void int_exit(int sig)
-{
-	(void)sig;
-
-	if (buffer) {
-		munmap(buffer, 1024 * 4096);
-		buffer = NULL;
-	}
-	cleanup_threads(ctx);
-	exit(EXIT_SUCCESS);
-}
-
 static unsigned long get_nsecs(void)
 {
 	struct timespec ts;
@@ -412,7 +400,7 @@ static unsigned long get_nsecs(void)
 	return ts.tv_sec * 1000000000UL + ts.tv_nsec;
 }
 
-static void *pthread_poller(void *data)
+static void *pthread_poller_dump(void *data)
 {
 	struct thread_context *ctx;
 	unsigned long prev_time;
@@ -430,8 +418,8 @@ static void *pthread_poller(void *data)
 	tx_packets = 0;
 	fmt = "%-15s %'-11.0f %'-11lu\n";
 	prev_time = get_nsecs();
-
-	for (;;) {
+	printf("Dumping .. Polls\n");
+	do {
 		tx_pps = 0;
 		sleep(1);
 		now = get_nsecs();
@@ -446,6 +434,84 @@ static void *pthread_poller(void *data)
 			tx_packets += ctx[i].prev_tx_packets;
 			if (pthread_mutex_unlock(&ctx->mutex))
 				exit(0);
+		}
+
+		tx_pps = tx_pps *
+			1000000000. / dt;
+
+		printf("\n");
+		printf("%-15s %-11s %-11s %-11.2f\n", "", "pps", "pkts",
+				dt / 1000000000.);
+		printf(fmt, "tx", tx_pps, tx_packets);
+
+	} while(0);
+	return NULL;
+}
+
+static void pthread_atexit(void)
+{
+	printf("PTHREAD_EXIT ---> function\n");
+	pthread_poller_dump(ctx);
+	if (buffer) {
+		munmap(buffer, 1024 * 4096);
+		buffer = NULL;
+	}
+	cleanup_threads(ctx);
+	exit(EXIT_SUCCESS);
+}
+
+static void int_exit(int sig)
+{
+	(void)sig;
+printf("INT_EXIT ---> function\n");
+	pthread_poller_dump(ctx);
+	if (buffer) {
+		munmap(buffer, 1024 * 4096);
+		buffer = NULL;
+	}
+	cleanup_threads(ctx);
+	exit(EXIT_SUCCESS);
+}
+
+static void *pthread_poller(void *data)
+{
+	struct thread_context *ctx;
+	unsigned long prev_time;
+	unsigned long long tx_packets;
+	double tx_pps;
+	char *fmt;
+	unsigned long now;
+	long dt;
+	int rc;
+	int i;
+
+	ctx = (struct thread_context *)data;
+	if (!ctx) {
+		printf("DATA IS NULL\n");
+		exit(1);	
+	}
+	tx_packets = 0;
+	fmt = "%-15s %'-11.0f %'-11lu\n";
+	prev_time = get_nsecs();
+
+	for (;;) {
+		tx_pps = 0;
+		sleep(1);
+		now = get_nsecs();
+		dt = now - prev_time;
+		prev_time = now;
+
+		for (i = 0; i < num_threads; i++) {
+			if (rc = pthread_mutex_lock(&ctx[i].mutex)) {
+				printf("MLOCK FAILED [%d] RET :[%d]\n", i, rc);
+			} else {
+				tx_pps += (ctx[i].tx_packets - ctx[i].prev_tx_packets);
+				ctx[i].prev_tx_packets = ctx[i].tx_packets;
+				tx_packets += ctx[i].prev_tx_packets;
+				if (pthread_mutex_unlock(&ctx->mutex)) {
+					printf("MUNLOCK FAILED [%d]\n", i);
+				}
+			}
 		}
 
 		tx_pps = tx_pps *
@@ -574,7 +640,8 @@ static int pthread_prepare_threads(struct thread_context *ctx, int num_threads,
 				return rc;
 			}
 
-			rc = pthread_mutexattr_settype(&ctx[i].mattr, PTHREAD_MUTEX_ERRORCHECK); 
+			//rc = pthread_mutexattr_settype(&ctx[i].mattr, PTHREAD_MUTEX_ERRORCHECK); 
+			rc = pthread_mutexattr_settype(&ctx[i].mattr, PTHREAD_MUTEX_NORMAL); 
 			if (rc != 0) {
 				printf("Pthreads mutex attr setup failed\n");
 				return rc;
@@ -630,7 +697,7 @@ static void *pthread_process_udp_transfers(void *data)
 		printf("Pthread Error, Invalid Data\n");
 		return NULL;
 	}
-
+printf("CTX [%p] \n", ctx);
 	pkts = &ctx->pkts;
 	if (!pkts) {
 		printf("Pthread Error, Invalid pkts\n");
@@ -652,14 +719,15 @@ static void *pthread_process_udp_transfers(void *data)
 			if (rc <= 0) {
 				printf("RETURN :%d\n", rc);
 				perror ("sendto failed\n");
-				goto failure;
-			}
+			//	goto failure;
+			} else {
 
-			if (pthread_mutex_lock(&ctx->mutex))
-				pthread_exit(NULL);
-			++ctx->tx_packets;
-			if (pthread_mutex_unlock(&ctx->mutex))
-				pthread_exit(NULL);
+				if (pthread_mutex_lock(&ctx->mutex))
+					pthread_exit(NULL);
+				++ctx->tx_packets;
+				if (pthread_mutex_unlock(&ctx->mutex))
+					pthread_exit(NULL);
+			}
 		}
 	}
 
@@ -726,9 +794,10 @@ static int send_udp_traffic(struct sockaddr_ll *src, struct sockaddr_ll *dst,
 	pkts.packet_len = frame_len;
 	pkts.total_packets = 4096;
 
-	signal(SIGINT, int_exit);
-	signal(SIGTERM, int_exit);
-	signal(SIGABRT, int_exit);
+	//signal(SIGINT, int_exit);
+	//signal(SIGTERM, int_exit);
+	//signal(SIGABRT, int_exit);
+	atexit(pthread_atexit);
 
 	setlocale(LC_ALL, "");
 
@@ -870,13 +939,22 @@ int main(int argc, char **argv)
 			exit(rc);
 		}
 
+#if 0
+		rc = pthread_create(&pt, NULL, pthread_poller, ctx);
+		if (rc) {
+			printf("Failed to setup Thread");
+			exit(1);
+		}
+		printf("Poller Thread started\n");
+		sleep(5);
+#endif
 		for (int i = 0; i < num_threads; i++) {
-			rc = pthread_create(&ctx[i].pt, NULL, pthread_process_udp_transfers, ctx + i);
+			printf("PTHREAD CCREATE [%d]\n", i);
+			rc = pthread_create(&ctx[i].pt, NULL, pthread_process_udp_transfers, &ctx[i]);
 			if (rc) {
 				printf("Failed to setup Thread");
 				exit(1);
 			}
-			sleep(10);
 		}
 
 		/* This is older way of sending traffic 
