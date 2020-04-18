@@ -28,8 +28,6 @@
 #include <linux/if_packet.h>  // struct sockaddr_ll (see man 7 packet)
 #include <net/ethernet.h>
 
-#include <errno.h>            // errno, perror()
-
 /* ARP protocol opcodes. */
 #define ARPOP_REQUEST   1               /* ARP request                  */
 #define ARPOP_REPLY     2               /* ARP reply                    */
@@ -140,6 +138,8 @@ struct udp_packets {
 
 struct thread_context { 
 	pthread_t pt;
+	pthread_rwlockattr_t rwattr;
+	pthread_rwlock_t rwlock;
 	pthread_mutex_t mlock;
 	pthread_spinlock_t slock;
 	pthread_mutexattr_t mattr;
@@ -459,6 +459,13 @@ static void *pthread_poller(void *data)
 #elif defined(USE_PTHREAD_SPINLOCK)
 			if (rc = pthread_spin_lock(&ctx[i].slock)) {
 				printf("SLOCK FAILED [%d] RET :[%d]\n", i, rc);
+#elif defined(USE_PTHREAD_RWLOCK)
+				do {
+					rc = pthread_rwlock_rdlock(&ctx[i].rwlock);
+				} while (rc != EAGAIN);
+			       	if (rc) {
+					printf("POLLER RWLOCK FAILED [%d] RET :[%d]\n", i, rc);
+
 #else
 				if (0) {
 					/* No Locking Defined */
@@ -468,13 +475,16 @@ static void *pthread_poller(void *data)
 				ctx[i].prev_tx_packets = ctx[i].tx_packets;
 				tx_packets += ctx[i].prev_tx_packets;
 #if defined(USE_PTHREAD_MUTEX) 
-				if (rc = pthread_mutex_unlock(&ctx->mlock)) {
+				if (rc = pthread_mutex_unlock(&ctx[i].mlock)) {
 					printf("MUNLOCK FAILED [%d] RET :[%d]\n", i, rc);
 					exit(1);
 #elif defined(USE_PTHREAD_SPINLOCK)
-				if (rc = pthread_spin_unlock(&ctx->slock)) {
+				if (rc = pthread_spin_unlock(&ctx[i].slock)) {
 					printf("SUNLOCK FAILED [%d] RET :[%d]\n", i, rc);
 					exit(1);
+#elif defined(USE_PTHREAD_RWLOCK)
+				if (rc = pthread_rwlock_unlock(&ctx[i].rwlock)) {
+					printf("RWUNLOCK FAILED [%d] RET :[%d]\n", i, rc);
 #else
 				if (0) {
 					/* No Locking Defined */
@@ -559,7 +569,7 @@ static int prepare_udp_frames(struct udp_packets *pkts,
 		frame->iph.version = 4;
 		frame->iph.tos = 1;
 		frame->iph.tot_len = ntohs(frame_len - sizeof(struct ethhdr));
-		frame->iph.id = ntohs(0x1234);
+		frame->iph.id = ntohs(0x1234 + index);
 		frame->iph.protocol = IPPROTO_UDP;
 		frame->iph.saddr = src_ip->sin_addr.s_addr;
 		frame->iph.daddr = dst_ip->sin_addr.s_addr;
@@ -609,13 +619,13 @@ static int pthread_prepare_threads(struct thread_context *ctx, int num_threads,
 				return rc;
 			}
 
-			rc = pthread_mutexattr_settype(&ctx[i].mattr, PTHREAD_MUTEX_ERRORCHECK); 
+			rc = pthread_mutexattr_settype(&ctx[i].mattr, PTHREAD_MUTEX_ERRORCHECK);
 			if (rc != 0) {
 				printf("Pthreads mutex attr setup failed\n");
 				return rc;
 			}
 
-			rc = pthread_mutex_init(&ctx[i].mlock, &ctx[i].mattr); 
+			rc = pthread_mutex_init(&ctx[i].mlock, &ctx[i].mattr);
 			if (rc != 0) {
 				printf("Pthreads mutex INIT failed\n");
 				return rc;
@@ -626,9 +636,22 @@ static int pthread_prepare_threads(struct thread_context *ctx, int num_threads,
 				printf("Pthread Mutex Attr Destroy Failed\n");
 			}
 #elif defined(USE_PTHREAD_SPINLOCK)
-			rc = pthread_spin_init(&ctx[i].slock, PTHREAD_PROCESS_PRIVATE); 
+			rc = pthread_spin_init(&ctx[i].slock, PTHREAD_PROCESS_PRIVATE);
 			if (rc != 0) {
 				printf("Pthreads SPIN LOCK INIT failed\n");
+				return rc;
+			}
+#elif defined(USE_PTHREAD_RWLOCK)
+	//		ctx[i].rwlock = PTHREAD_RWLOCK_INITIALIZER;
+			rc = pthread_rwlockattr_init(&ctx[i].rwattr);
+			if (rc != 0) {
+				printf("Pthreads RW ATTR INIT failed\n");
+				return rc;
+			}
+
+			rc = pthread_rwlock_init(&ctx[i].rwlock, &ctx[i].rwattr);
+			if (rc != 0) {
+				printf("Pthreads RW LOCK INIT failed\n");
 				return rc;
 			}
 #endif
@@ -654,7 +677,6 @@ static int pthread_prepare_threads(struct thread_context *ctx, int num_threads,
 		}
 	}
 
-	printf("Prepared Pthreads [%d]\n", num_threads);
 	return 0;
 }
 
@@ -703,6 +725,9 @@ printf("CTX [%p] \n", ctx);
 #elif defined(USE_PTHREAD_SPINLOCK)
 				if (rc = pthread_spin_lock(&ctx->slock)) {
 					printf("Failed to get Lock in Thread, RET: %d\n", rc);
+#elif defined(USE_PTHREAD_RWLOCK)
+				if (rc = pthread_rwlock_wrlock(&ctx->rwlock)) {
+					printf("Failed to get Lock in Thread, RET: %d\n", rc);
 #else
 					if (0) {
 #endif
@@ -714,6 +739,9 @@ printf("CTX [%p] \n", ctx);
 					printf("Failed to get Lock in Thread, RET: %d\n", rc);
 #elif defined(USE_PTHREAD_SPINLOCK)
 				if (pthread_spin_unlock(&ctx->slock)) {
+					printf("Failed to get Lock in Thread, RET: %d\n", rc);
+#elif defined(USE_PTHREAD_RWLOCK)
+				if (pthread_rwlock_unlock(&ctx->rwlock)) {
 					printf("Failed to get Lock in Thread, RET: %d\n", rc);
 #else
 					if (0) {
@@ -896,12 +924,6 @@ int main(int argc, char **argv)
 	memcpy(src_dev.sll_addr, ethh->h_source, ETH_ALEN);
 	src_dev.sll_halen = ETH_ALEN;
 
-	sock = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-	if (sock < 0) {
-		perror ("socket creation with AF_INET SOCK_RAW ETH_P_ARP failed ");
-		exit (EXIT_FAILURE);
-	}
-
 	rc = process_arp_request(&src_dev, req, resp);
 	if (!rc) {
 		arph = &resp->arph;
@@ -932,17 +954,7 @@ int main(int argc, char **argv)
 			exit(rc);
 		}
 
-#if 0
-		rc = pthread_create(&pt, NULL, pthread_poller, ctx);
-		if (rc) {
-			printf("Failed to setup Thread");
-			exit(1);
-		}
-		printf("Poller Thread started\n");
-		sleep(5);
-#endif
 		for (int i = 0; i < num_threads; i++) {
-			printf("PTHREAD CCREATE [%d]\n", i);
 			rc = pthread_create(&ctx[i].pt, NULL, pthread_process_udp_transfers, &ctx[i]);
 			if (rc) {
 				printf("Failed to setup Thread");
@@ -950,9 +962,6 @@ int main(int argc, char **argv)
 			}
 		}
 
-		/* This is older way of sending traffic 
-		   rc = send_udp_traffic(&src_dev, &dst_dev, &src_ip, &dst_ip);
-		   */
 		pthread_poller(ctx);
 	}
 

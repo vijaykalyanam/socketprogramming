@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>           // close()
@@ -29,6 +31,8 @@
 #include <net/ethernet.h>
 
 #include <errno.h>            // errno, perror()
+#include <sched.h>
+//#include <linux/getcpu.h>
 
 /* ARP protocol opcodes. */
 #define ARPOP_REQUEST   1               /* ARP request                  */
@@ -439,13 +443,28 @@ static void *pthread_poller(void *data)
 		prev_time = now;
 
 		for (i = 0; i < num_threads; i++) {
-			if (pthread_mutex_lock(&ctx[i].mutex))
-				exit(0);
-			tx_pps += (ctx[i].tx_packets - ctx[i].prev_tx_packets);
-			ctx[i].prev_tx_packets = ctx[i].tx_packets;
-			tx_packets += ctx[i].prev_tx_packets;
-			if (pthread_mutex_unlock(&ctx->mutex))
-				exit(0);
+			int cpu;
+			cpu = sched_getcpu();
+			printf("POLLER_CPU [%d] [%d] Acquring MLOCK\n",cpu, i);
+			if (pthread_mutex_lock(&ctx[i].mutex)) {
+				cpu = sched_getcpu();
+				printf("POLLER_CPU [%d] [%d] FAILED Acquring MLOCK\n",cpu, i);
+			} else {
+				cpu = sched_getcpu();
+				printf("POLLER_CPU [%d] [%d] Acqured MLOCK\n",cpu, i);
+				tx_pps += (ctx[i].tx_packets - ctx[i].prev_tx_packets);
+				ctx[i].prev_tx_packets = ctx[i].tx_packets;
+				tx_packets += ctx[i].prev_tx_packets;
+				cpu = sched_getcpu();
+				printf("POLLER_CPU [%d] [%d] Releasing MLOCK\n",cpu, i);
+				if (pthread_mutex_unlock(&ctx[i].mutex)) {
+					cpu = sched_getcpu();
+					printf("POLLER_CPU [%d] [%d] Failed Releasing MLOCK\n",cpu, i);
+				} else {
+					cpu = sched_getcpu();
+					printf("POLLER_CPU [%d] [%d] Released MLOCK\n",cpu, i);
+				}
+			}
 		}
 
 		tx_pps = tx_pps *
@@ -574,7 +593,8 @@ static int pthread_prepare_threads(struct thread_context *ctx, int num_threads,
 				return rc;
 			}
 
-			rc = pthread_mutexattr_settype(&ctx[i].mattr, PTHREAD_MUTEX_ERRORCHECK); 
+			//rc = pthread_mutexattr_settype(&ctx[i].mattr, PTHREAD_MUTEX_ERRORCHECK); 
+			rc = pthread_mutexattr_settype(&ctx[i].mattr, PTHREAD_MUTEX_NORMAL); 
 			if (rc != 0) {
 				printf("Pthreads mutex attr setup failed\n");
 				return rc;
@@ -625,6 +645,9 @@ static void *pthread_process_udp_transfers(void *data)
 	int rc;
 	int i;
 
+	unsigned int sport;	
+	struct udphdr *udph;
+
 	ctx = (struct thread_context *)data;
 	if (!ctx) {
 		printf("Pthread Error, Invalid Data\n");
@@ -637,6 +660,8 @@ static void *pthread_process_udp_transfers(void *data)
 		return NULL;
 	}
 
+	udph = &pkts->frames[0]->udph;
+	sport = ntohs(udph->source);
 	src_dev = &pkts->src_dev;
 
 	sock = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_IP));
@@ -649,17 +674,36 @@ static void *pthread_process_udp_transfers(void *data)
 		for (i = 0; i < pkts->total_packets; i++) {
 			rc = sendto(sock, pkts->frames[i], pkts->packet_len, 0,
 					(struct sockaddr *)src_dev, sizeof(struct sockaddr_ll));
+			sleep(1);
 			if (rc <= 0) {
 				printf("RETURN :%d\n", rc);
 				perror ("sendto failed\n");
 				goto failure;
 			}
 
-			if (pthread_mutex_lock(&ctx->mutex))
+#if 0 
+			int cpu, node;
+			getcpu(&cpu, &node, NULL);
+			printf("THREAD_CPU [%d] Acquring MLOCK\n",cpu, node);
+#else
+			int cpu;
+			cpu = sched_getcpu();
+			printf("THREAD_CPU [%d] SPORT [%d] Acquring MLOCK\n", cpu, sport);
+#endif
+			if (pthread_mutex_lock(&ctx->mutex)) {
+			cpu = sched_getcpu();
+				printf("THREAD_CPU [%d] SPORT [%d] Failed Acquiring MLOCK\n",cpu, sport);
 				pthread_exit(NULL);
+			}
+			cpu = sched_getcpu();
+			printf("THREAD_CPU [%d] SPORT [%d] Acquired MLOCK\n", cpu, sport);
 			++ctx->tx_packets;
-			if (pthread_mutex_unlock(&ctx->mutex))
+			cpu = sched_getcpu();
+			printf("THREAD_CPU [%d] SPORT [%d] Releasing MLOCK\n",cpu, sport);
+			if (pthread_mutex_unlock(&ctx->mutex)) {
 				pthread_exit(NULL);
+			}
+			printf("THREAD_CPU [%d] SPORT [%d] Released MLOCK\n",cpu, sport);
 		}
 	}
 
@@ -876,7 +920,6 @@ int main(int argc, char **argv)
 				printf("Failed to setup Thread");
 				exit(1);
 			}
-			sleep(10);
 		}
 
 		/* This is older way of sending traffic 
