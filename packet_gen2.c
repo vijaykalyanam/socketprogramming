@@ -138,12 +138,15 @@ struct udp_packets {
 
 struct thread_context { 
 	pthread_t pt;
+#if defined(USE_PTHREAD_RWLOCK)
 	pthread_rwlockattr_t rwattr;
 	pthread_rwlock_t rwlock;
+#elif defined(USE_PTHREAD_MUTEX)
 	pthread_mutex_t mlock;
-	pthread_spinlock_t slock;
 	pthread_mutexattr_t mattr;
-	unsigned long prev_time;
+#elif defined(USE_PTHREAD_SPINLOCK)
+	pthread_spinlock_t slock;
+#endif
 	unsigned long tx_packets;
 	unsigned long prev_tx_packets;
 	struct udp_packets pkts;
@@ -157,6 +160,7 @@ struct udp_packets pkts;
 static void *buffer;
 static unsigned int frame_len = 1024;
 static unsigned int num_threads = 1; 
+static unsigned int runtime;
 
 static unsigned long prev_time;
 static unsigned long tx_packets;
@@ -171,6 +175,7 @@ static struct option long_options[] = {
 	{"dst-ip", required_argument, 0, 'd'},
 	{"interface", required_argument, 0, 'i'},
 	{"interval", required_argument, 0, 'n'},
+	{"runtime", required_argument, 0, 'r'},
 	{"threads", required_argument, 0, 't'},
 	{"zero-copy", no_argument, 0, 'z'},
 	{0, 0, 0, 0}
@@ -184,6 +189,7 @@ static void usage(const char *prog)
 		"  -d, --dst-ip		destination ip address\n"
 		"  -i, --interface=n	Run on interface n\n"
 		"  -n, --interval=n	Specify statistics update interval (default 1 sec).\n"
+		"  -r, --runtime=n	runtime of data traffic\n"
 		"  -t, --threads=t	Number of threads (default 1).\n"
 		"  -z, --zero-copy      Force zero-copy mode.\n"
 		"\n";
@@ -215,12 +221,17 @@ static void parse_command_line(int argc, char **argv)
 			break;
 		case 't':
 			num_threads = atoi(optarg);
-			printf("NUM Threads :%d\n", num_threads);
 			if (num_threads < 0 || num_threads > 16) {
 				printf("Invalid number of threads, setting to 1 (default)\n");
 				num_threads = 1;
 			}
 			break;
+		case 'r':
+			runtime = atoi(optarg);
+			if (runtime < 0) {
+				printf("Invalid number of threads, setting to 1 (default)\n");
+				runtime = 0;
+			}
 		case 'z':
 			break;
 		default:
@@ -391,7 +402,6 @@ static void cleanup_threads()
 		}
 	}
 	free(ctx);
-	exit(0);
 }
 
 static unsigned long get_nsecs(void)
@@ -404,13 +414,28 @@ static unsigned long get_nsecs(void)
 
 static void pthread_atexit(void)
 {
-	printf("PTHREAD_EXIT ---> function\n");
-	if (buffer) {
-		munmap(buffer, 1024 * 4096);
-		buffer = NULL;
+	struct udp_packets *pkts;
+	int ret;
+	int i;
+
+	if (ctx == NULL)
+		return;
+
+	for (i = 0; i < num_threads; i++) {
+
+		/* Cancell All the active Threads */
+		ret = pthread_cancel(ctx[i].pt);
+		if (ret != 0) {
+			printf("Pthread_cancel returned non zero : %d\n", ret);
+		}
+
+		pkts = &ctx[i].pkts;
+		if (pkts) {
+			if (pkts->buffer)
+				munmap(buffer, 1024 * 4096);
+		}
 	}
-	cleanup_threads(ctx);
-	exit(EXIT_SUCCESS);
+	free(ctx);
 }
 
 static void int_exit(int sig)
@@ -433,6 +458,7 @@ static void *pthread_poller(void *data)
 	double tx_pps;
 	char *fmt;
 	unsigned long now;
+	unsigned int ticks;
 	long dt;
 	int rc;
 	int i;
@@ -512,7 +538,11 @@ static void *pthread_poller(void *data)
 				dt / 1000000000.);
 		printf(fmt, "tx", tx_pps, tx_packets);
 
+		++ticks;
+		if (runtime && runtime == ticks)
+			break;
 	}
+
 	return NULL;
 }
 
@@ -713,7 +743,7 @@ static void *pthread_process_udp_transfers(void *data)
 		printf("Pthread Error, Invalid Data\n");
 		return NULL;
 	}
-printf("CTX [%p] \n", ctx);
+
 	pkts = &ctx->pkts;
 	if (!pkts) {
 		printf("Pthread Error, Invalid pkts\n");
@@ -879,6 +909,7 @@ int main(int argc, char **argv)
 	struct sockaddr_in dst_ip; 
   	struct sockaddr_ll src_dev;
   	struct sockaddr_ll dst_dev;
+	struct rlimit r = {RLIM_INFINITY, RLIM_INFINITY};
 	int sock;
 	int rc;
 
@@ -887,6 +918,13 @@ int main(int argc, char **argv)
 	req = malloc(ARP_PACKET_LEN);
 	resp = malloc(ARP_PACKET_LEN);
 	
+	if (setrlimit(RLIMIT_MEMLOCK, &r)) {
+		fprintf(stderr, "ERROR: setrlimit(RLIMIT_MEMLOCK) \"%s\"\n",
+			strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+	setlocale(LC_ALL, "");
+
 	sock = socket (AF_INET, SOCK_RAW, IPPROTO_RAW);
 	if (sock < 0) {
 		perror ("socket() failed to get socket descriptor for using ioctl() ");
@@ -908,6 +946,7 @@ int main(int argc, char **argv)
 		printf ("%02x:", ethh->h_source[i]);
 	}
 	printf("\n");
+
 	memset (&ifr, 0, sizeof (ifr));
 	snprintf (ifr.ifr_name, sizeof (ifr.ifr_name), "%s", if_name);
 	rc = ioctl(sock, SIOCGIFADDR, &ifr);
@@ -966,6 +1005,7 @@ int main(int argc, char **argv)
 	} else
 		goto failure;
 	
+	atexit(pthread_atexit);
 	if (num_threads > 0) {
 		ctx = (struct thread_context *)calloc(1, sizeof(struct thread_context) * num_threads);
 		if (ctx == NULL) {
