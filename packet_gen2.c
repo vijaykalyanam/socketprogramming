@@ -149,6 +149,7 @@ struct thread_context {
 	struct udp_packets pkts;
 };
 
+pthread_spinlock_t slock;
 static struct thread_context *ctx;
 pthread_t pt;
 struct udp_packets pkts;
@@ -451,7 +452,12 @@ static void *pthread_poller(void *data)
 		now = get_nsecs();
 		dt = now - prev_time;
 		prev_time = now;
-
+#if !defined(USE_PTHREAD_MUTEX) && !defined(USE_PTHREAD_SPINLOCK) && !defined(USE_PTHREAD_RWLOCK)
+		if (rc = pthread_spin_lock(&slock)) {
+			printf("SLOCK FAILED [%d] RET :[%d]\n", i, rc);
+			continue;
+		}
+#endif
 		for (i = 0; i < num_threads; i++) {
 #if defined(USE_PTHREAD_MUTEX) 
 			if (rc = pthread_mutex_lock(&ctx[i].mlock)) {
@@ -492,6 +498,12 @@ static void *pthread_poller(void *data)
 				}
 			}
 		}
+#if !defined(USE_PTHREAD_MUTEX) && !defined(USE_PTHREAD_SPINLOCK) && !defined(USE_PTHREAD_RWLOCK)
+		if (rc = pthread_spin_unlock(&slock)) {
+				printf("SUNLOCK FAILED [%d] RET :[%d]\n", i, rc);
+				exit(1);
+		}
+#endif
 		tx_pps = tx_pps *
 			1000000000. / dt;
 
@@ -609,6 +621,13 @@ static int pthread_prepare_threads(struct thread_context *ctx, int num_threads,
 	int i;
 	int rc;
 
+#if !defined(USE_PTHREAD_MUTEX) && !defined(USE_PTHREAD_SPINLOCK) && !defined(USE_PTHREAD_RWLOCK)
+	rc = pthread_spin_init(&slock, PTHREAD_PROCESS_PRIVATE);
+	if (rc != 0) {
+		printf("Pthreads SPIN LOCK INIT failed\n");
+		return rc;
+	}
+#endif
 	for (i = 0; i < num_threads; i++) {
 		pkts = &ctx[i].pkts; 
 		if (pkts) {
@@ -728,6 +747,9 @@ printf("CTX [%p] \n", ctx);
 #elif defined(USE_PTHREAD_RWLOCK)
 				if (rc = pthread_rwlock_wrlock(&ctx->rwlock)) {
 					printf("Failed to get Lock in Thread, RET: %d\n", rc);
+#elif !defined(USE_PTHREAD_MUTEX) && !defined(USE_PTHREAD_SPINLOCK) && !defined(USE_PTHREAD_RWLOCK)
+				if (rc = pthread_spin_lock(&slock)) {
+					printf("Failed to get Lock in Thread, RET: %d\n", rc);
 #else
 					if (0) {
 #endif
@@ -742,6 +764,9 @@ printf("CTX [%p] \n", ctx);
 					printf("Failed to get Lock in Thread, RET: %d\n", rc);
 #elif defined(USE_PTHREAD_RWLOCK)
 				if (pthread_rwlock_unlock(&ctx->rwlock)) {
+					printf("Failed to get Lock in Thread, RET: %d\n", rc);
+#elif !defined(USE_PTHREAD_MUTEX) && !defined(USE_PTHREAD_SPINLOCK) && !defined(USE_PTHREAD_RWLOCK)
+				if (pthread_spin_unlock(&slock)) {
 					printf("Failed to get Lock in Thread, RET: %d\n", rc);
 #else
 					if (0) {
